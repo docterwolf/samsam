@@ -1,263 +1,272 @@
 import os
-import sys
+import re
 import asyncio
 import subprocess
-from dataclasses import dataclass
-from typing import Optional, List
+import sys
+from typing import Dict, Any
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
-import uvicorn
-
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
 from divar_automation import (
-    has_valid_session, start_login, verify_otp, create_post_on_divar, logout
+    has_valid_session,
+    start_login,
+    verify_otp,
+    create_post_on_divar,
+    logout,
 )
 
-load_dotenv()
+# ---------------- ENV ----------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+    raise RuntimeError("BOT_TOKEN is missing in environment variables")
 
-PHONE, OTP = range(2)
-CAT, TITLE, DESC, PRICE, CONFIRM = range(2, 7)
-
-@dataclass
-class PostDraft:
-    category_index: int = 0
-    title: str = ""
-    description: str = ""
-    price: str = ""
-    image_paths: Optional[List[str]] = None
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
 
-# -------------------- Playwright bootstrap --------------------
-def ensure_playwright_browser_installed():
+# ---------------- STATE ----------------
+
+api = FastAPI()
+
+# برای اینکه هر چت جداگانه مرحله خودش رو داشته باشه
+user_state: Dict[int, Dict[str, Any]] = {}
+
+
+def get_state(chat_id: int):
+    if chat_id not in user_state:
+        user_state[chat_id] = {
+            "step": None,      # phone / otp / idle
+            "phone": None,
+        }
+    return user_state[chat_id]
+
+
+# ---------------- PLAYWRIGHT INSTALL ----------------
+
+def ensure_playwright_browser():
+    """
+    Render ممکنه موقع build مرورگر رو دانلود نکنه.
+    پس اینجا هنگام startup خودمون نصب chromium رو انجام میدیم.
+    """
     try:
-        print("[startup] Ensuring Playwright Chromium is installed...")
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-        print("[startup] Playwright Chromium OK.")
+        subprocess.check_call(
+            [sys.executable, "-m", "playwright", "install", "chromium"]
+        )
     except Exception as e:
-        print("[startup] Playwright install failed:", repr(e))
+        print("Playwright install failed:", e)
 
 
-# -------------------- Telegram handlers --------------------
+# ---------------- TELEGRAM HANDLERS ----------------
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام!\n"
-        "/login برای ورود\n"
-        "/logout برای خروج\n"
-        "/newpost برای ثبت آگهی\n"
-        "/cancel برای لغو"
+        "سلام 👋\n"
+        "من ربات ثبت آگهی دیوارم.\n\n"
+        "دستورات:\n"
+        "/login  شروع لاگین\n"
+        "/post   ثبت آگهی نمونه\n"
+        "/logout خروج کامل از دیوار\n"
+        "/status وضعیت سشن\n"
     )
 
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("در حال بررسی سشن...")
+    ok = await has_valid_session()
+    if ok:
+        await update.message.reply_text("✅ سشن معتبره (لاگین هستی).")
+    else:
+        await update.message.reply_text("❌ سشن معتبر نیست (لاگین نیستی).")
+
+
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    st = get_state(chat_id)
+
+    # اگر از قبل لاگین بودی
     if await has_valid_session():
-        await update.message.reply_text("سشن معتبره ✅\nاگر می‌خوای خارج شی /logout بزن.")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "سشن معتبره ✅\n"
+            "اگر می‌خوای خارج شی /logout بزن."
+        )
+        st["step"] = None
+        return
+
+    st["step"] = "phone"
+    st["phone"] = None
+
     await update.message.reply_text("شماره موبایل رو بفرست (09xxxxxxxxx):")
-    return PHONE
-
-
-async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    await update.message.reply_text("در حال درخواست کد...")
-
-    try:
-        await start_login(update.effective_chat.id, phone)
-    except Exception as e:
-        await update.message.reply_text(f"خطا در درخواست کد: {e}")
-        return ConversationHandler.END
-
-    await update.message.reply_text("کد ۶ رقمی رو بفرست:")
-    return OTP
-
-
-async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    otp = update.message.text.strip()
-    await update.message.reply_text("در حال تایید...")
-
-    try:
-        ok = await verify_otp(update.effective_chat.id, otp)
-        await update.message.reply_text("لاگین موفق ✅" if ok else "لاگین ناموفق ❌")
-    except Exception as e:
-        await update.message.reply_text(f"خطا: {e}")
-
-    return ConversationHandler.END
 
 
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("در حال خروج از حساب دیوار و پاک کردن سشن...")
+    chat_id = update.effective_chat.id
+
+    await update.message.reply_text("در حال خروج کامل از دیوار...")
+
     try:
-        await logout(update.effective_chat.id)
-        await update.message.reply_text("✅ خارج شدی. حالا می‌تونی دوباره /login بزنی.")
+        await logout(chat_id)
+        await update.message.reply_text(
+            "✅ کامل خارج شدی.\n"
+            "حالا برای ورود دوباره /login بزن."
+        )
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در logout: {e}")
 
 
-async def cmd_newpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
     if not await has_valid_session():
-        await update.message.reply_text("اول /login رو انجام بده.")
-        return ConversationHandler.END
+        await update.message.reply_text("❌ اول باید /login کنی.")
+        return
 
-    context.user_data["draft"] = PostDraft()
-    await update.message.reply_text("category_index رو بفرست (مثلاً 0):")
-    return CAT
-
-
-async def post_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data["draft"].category_index = int(update.message.text.strip())
-    except:
-        await update.message.reply_text("فقط عدد بفرست (مثلاً 0).")
-        return CAT
-    await update.message.reply_text("عنوان آگهی:")
-    return TITLE
-
-
-async def post_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["draft"].title = update.message.text.strip()
-    await update.message.reply_text("توضیحات آگهی:")
-    return DESC
-
-
-async def post_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["draft"].description = update.message.text.strip()
-    await update.message.reply_text("قیمت (عدد):")
-    return PRICE
-
-
-async def post_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["draft"].price = update.message.text.strip()
-    d: PostDraft = context.user_data["draft"]
-    await update.message.reply_text(
-        "تایید نهایی؟ فقط ✅ بفرست\n\n"
-        f"category_index: {d.category_index}\n"
-        f"عنوان: {d.title}\n"
-        f"قیمت: {d.price}"
-    )
-    return CONFIRM
-
-
-async def post_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.strip() != "✅":
-        await update.message.reply_text("لغو شد.")
-        return ConversationHandler.END
-
-    d: PostDraft = context.user_data["draft"]
-    await update.message.reply_text("در حال ثبت آگهی...")
+    await update.message.reply_text("در حال ساخت آگهی نمونه...")
 
     try:
-        res = await create_post_on_divar(
-            category_index=d.category_index,
-            title=d.title,
-            description=d.description,
-            price=d.price,
-            image_paths=d.image_paths,
-            chat_id=update.effective_chat.id,
+        result = await create_post_on_divar(
+            chat_id=chat_id,
+            category_index=0,  # اولین گزینه دسته
+            title="آگهی تستی ربات",
+            description="این آگهی تستی توسط ربات ساخته شده است.",
+            price="150000",
+            image_paths=None
         )
-        await update.message.reply_text(res)
+        await update.message.reply_text(result)
     except Exception as e:
-        await update.message.reply_text(f"خطا: {e}")
-
-    return ConversationHandler.END
+        await update.message.reply_text(f"❌ خطا در ثبت آگهی: {e}")
 
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("لغو شد.")
-    return ConversationHandler.END
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
 
+    st = get_state(chat_id)
+    step = st.get("step")
+
+    # ---------------- STEP: PHONE ----------------
+    if step == "phone":
+        phone = re.sub(r"\D", "", text)
+
+        # اگر کاربر 98 زد تبدیلش کنیم
+        if phone.startswith("98"):
+            phone = "0" + phone[2:]
+
+        if not phone.startswith("09") or len(phone) != 11:
+            await update.message.reply_text("❌ شماره معتبر نیست. مثال: 09351234567")
+            return
+
+        st["phone"] = phone
+
+        await update.message.reply_text("در حال درخواست کد...")
+
+        try:
+            await start_login(chat_id, phone)
+            st["step"] = "otp"
+            await update.message.reply_text("کد ۶ رقمی رو بفرست:")
+        except Exception as e:
+            st["step"] = None
+            await update.message.reply_text(f"❌ خطا در درخواست کد: {e}")
+
+        return
+
+    # ---------------- STEP: OTP ----------------
+    if step == "otp":
+        code = re.sub(r"\D", "", text)[:6]
+
+        if len(code) != 6:
+            await update.message.reply_text("❌ کد باید ۶ رقم باشه.")
+            return
+
+        await update.message.reply_text("در حال تایید...")
+
+        try:
+            ok = await verify_otp(chat_id, code)
+            if ok:
+                st["step"] = None
+                await update.message.reply_text("✅ لاگین انجام شد!")
+            else:
+                await update.message.reply_text("❌ کد اشتباهه یا تایید نشد. دوباره بفرست.")
+        except Exception as e:
+            st["step"] = None
+            await update.message.reply_text(f"❌ خطا در تایید کد: {e}")
+
+        return
+
+    # ---------------- DEFAULT ----------------
+    await update.message.reply_text(
+        "متوجه نشدم چی گفتی 😅\n"
+        "از دستورات استفاده کن:\n"
+        "/login\n"
+        "/post\n"
+        "/logout\n"
+        "/status"
+    )
+
+
+# ---------------- TELEGRAM APP ----------------
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    login_conv = ConversationHandler(
-        entry_points=[CommandHandler("login", cmd_login)],
-        states={
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_phone)],
-            OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_otp)],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-
-    post_conv = ConversationHandler(
-        entry_points=[CommandHandler("newpost", cmd_newpost)],
-        states={
-            CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_cat)],
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_title)],
-            DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_desc)],
-            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_price)],
-            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, post_confirm)],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("logout", cmd_logout))
-    app.add_handler(login_conv)
-    app.add_handler(post_conv)
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("post", cmd_post))
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     return app
 
 
-# -------------------- FastAPI (Render Web Service) --------------------
-api = FastAPI()
-telegram_app: Optional[Application] = None
-telegram_task: Optional[asyncio.Task] = None
-
-
-@api.get("/")
-async def root():
-    return {"status": "ok", "telegram": "running" if telegram_task and not telegram_task.done() else "stopped"}
-
-
-@api.get("/health")
-async def health():
-    return {"ok": True}
+telegram_app: Application = None
+telegram_task = None
 
 
 @api.on_event("startup")
 async def on_startup():
     global telegram_app, telegram_task
 
-    # Ensure chromium exists (Render fix)
-    ensure_playwright_browser_installed()
+    # نصب chromium برای playwright (روی Render ضروریه)
+    ensure_playwright_browser()
 
     telegram_app = build_telegram_app()
+    await telegram_app.initialize()
+    await telegram_app.start()
 
-    async def runner():
-        await telegram_app.initialize()
-        await telegram_app.start()
-        await telegram_app.updater.start_polling()
-        while True:
-            await asyncio.sleep(3600)
-
-    telegram_task = asyncio.create_task(runner())
+    telegram_task = asyncio.create_task(telegram_app.updater.start_polling())
+    print("Telegram bot started.")
 
 
 @api.on_event("shutdown")
 async def on_shutdown():
     global telegram_app, telegram_task
+
+    try:
+        if telegram_task:
+            telegram_task.cancel()
+    except:
+        pass
+
     try:
         if telegram_app:
             await telegram_app.updater.stop()
             await telegram_app.stop()
             await telegram_app.shutdown()
-    except Exception:
-        pass
-    try:
-        if telegram_task and not telegram_task.done():
-            telegram_task.cancel()
-    except Exception:
+    except:
         pass
 
+    print("Telegram bot stopped.")
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("bot:api", host="0.0.0.0", port=port, log_level="info")
+
+@api.get("/")
+async def root():
+    return {"status": "ok", "bot": "running"}
