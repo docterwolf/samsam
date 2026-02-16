@@ -1,5 +1,7 @@
 import os
+import sys
 import asyncio
+import subprocess
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -21,8 +23,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
+# ---- Conversation States ----
 PHONE, OTP = range(2)
 CAT, TITLE, DESC, PRICE, CONFIRM = range(2, 7)
+
 
 @dataclass
 class PostDraft:
@@ -33,9 +37,30 @@ class PostDraft:
     image_paths: Optional[List[str]] = None
 
 
-# ---------- Telegram Handlers ----------
+# -------------------- Playwright bootstrap --------------------
+def ensure_playwright_browser_installed():
+    """
+    Ensures Playwright's Chromium exists at runtime.
+    This fixes Render deployments where browsers are not persisted from build.
+    """
+    try:
+        # This respects PLAYWRIGHT_BROWSERS_PATH env (you set it to 0)
+        print("[startup] Ensuring Playwright Chromium is installed...")
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        print("[startup] Playwright Chromium OK.")
+    except Exception as e:
+        # We do NOT crash the service; but automation will fail until fixed.
+        print("[startup] Playwright install failed:", repr(e))
+
+
+# -------------------- Telegram handlers --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("سلام!\n/login برای ورود\n/newpost برای ثبت آگهی\n/cancel برای لغو")
+    await update.message.reply_text(
+        "سلام!\n"
+        "/login برای ورود\n"
+        "/newpost برای ثبت آگهی\n"
+        "/cancel برای لغو"
+    )
 
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49,6 +74,7 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     await update.message.reply_text("در حال درخواست کد...")
+
     try:
         await start_login(update.effective_chat.id, phone)
     except Exception as e:
@@ -62,11 +88,13 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     otp = update.message.text.strip()
     await update.message.reply_text("در حال تایید...")
+
     try:
         ok = await verify_otp(update.effective_chat.id, otp)
         await update.message.reply_text("لاگین موفق ✅" if ok else "لاگین ناموفق ❌")
     except Exception as e:
         await update.message.reply_text(f"خطا: {e}")
+
     return ConversationHandler.END
 
 
@@ -86,6 +114,7 @@ async def post_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("فقط عدد بفرست (مثلاً 0).")
         return CAT
+
     await update.message.reply_text("عنوان آگهی:")
     return TITLE
 
@@ -105,6 +134,7 @@ async def post_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["draft"].price = update.message.text.strip()
     d: PostDraft = context.user_data["draft"]
+
     await update.message.reply_text(
         "تایید نهایی؟ فقط ✅ بفرست\n\n"
         f"category_index: {d.category_index}\n"
@@ -172,7 +202,7 @@ def build_telegram_app() -> Application:
     return app
 
 
-# ---------- FastAPI (برای Web Service) ----------
+# -------------------- FastAPI for Render --------------------
 api = FastAPI()
 telegram_app: Optional[Application] = None
 telegram_task: Optional[asyncio.Task] = None
@@ -180,7 +210,10 @@ telegram_task: Optional[asyncio.Task] = None
 
 @api.get("/")
 async def root():
-    return {"status": "ok", "bot": "running" if telegram_task and not telegram_task.done() else "stopped"}
+    return {
+        "status": "ok",
+        "telegram": "running" if telegram_task and not telegram_task.done() else "stopped"
+    }
 
 
 @api.get("/health")
@@ -191,14 +224,18 @@ async def health():
 @api.on_event("startup")
 async def on_startup():
     global telegram_app, telegram_task
+
+    # ✅ Fix Playwright missing chromium on Render
+    ensure_playwright_browser_installed()
+
     telegram_app = build_telegram_app()
 
     async def runner():
-        # start polling inside existing event loop
         await telegram_app.initialize()
         await telegram_app.start()
         await telegram_app.updater.start_polling()
-        # keep it alive
+
+        # keep alive
         while True:
             await asyncio.sleep(3600)
 
@@ -208,6 +245,7 @@ async def on_startup():
 @api.on_event("shutdown")
 async def on_shutdown():
     global telegram_app, telegram_task
+
     try:
         if telegram_app:
             await telegram_app.updater.stop()
@@ -215,6 +253,7 @@ async def on_shutdown():
             await telegram_app.shutdown()
     except:
         pass
+
     try:
         if telegram_task and not telegram_task.done():
             telegram_task.cancel()
