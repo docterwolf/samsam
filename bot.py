@@ -68,13 +68,11 @@ def ensure_playwright_browser():
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "سلام 👋\n"
-        "من ربات ثبت آگهی دیوارم.\n\n"
-        "دستورات:\n"
-        "/login  شروع لاگین\n"
-        "/post   ثبت آگهی نمونه\n"
+        "سلام ارباب 👋\n"
+        "/login  شروع\n"
+        "/post   ثبت آگهی\n"
         "/logout خروج کامل از دیوار\n"
-        "/status وضعیت سشن\n"
+        "/status وضعیت\n"
     )
 
 
@@ -82,9 +80,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("در حال بررسی سشن...")
     ok = await has_valid_session()
     if ok:
-        await update.message.reply_text("✅ سشن معتبره (لاگین هستی).")
+        await update.message.reply_text("✅ سشن معتبر")
     else:
-        await update.message.reply_text("❌ سشن معتبر نیست (لاگین نیستی).")
+        await update.message.reply_text("❌ سشن معتبر نیست ")
 
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,7 +101,7 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st["step"] = "phone"
     st["phone"] = None
 
-    await update.message.reply_text("شماره موبایل رو بفرست (09xxxxxxxxx):")
+    await update.message.reply_text("شماره موبایل ارباب (09xxxxxxxxx):")
 
 
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -114,8 +112,7 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await logout(chat_id)
         await update.message.reply_text(
-            "✅ کامل خارج شدی.\n"
-            "حالا برای ورود دوباره /login بزن."
+            "✅ کامل خارج شد.\n"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در logout: {e}")
@@ -134,8 +131,8 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await create_post_on_divar(
             chat_id=chat_id,
             category_index=0,  # اولین گزینه دسته
-            title="آگهی تستی ربات",
-            description="این آگهی تستی توسط ربات ساخته شده است.",
+            title="سر تیتر اگهی",
+            description="اناو ابراهام لینکلن بر فراز رود سفید سیاه",
             price="150000",
             image_paths=None
         )
@@ -170,7 +167,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await start_login(chat_id, phone)
             st["step"] = "otp"
-            await update.message.reply_text("کد ۶ رقمی رو بفرست:")
+            await update.message.reply_text("کد ۶ رقمی به گوشیتون پیامک شد ارباب:")
         except Exception as e:
             st["step"] = None
             await update.message.reply_text(f"❌ خطا در درخواست کد: {e}")
@@ -202,8 +199,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------------- DEFAULT ----------------
     await update.message.reply_text(
-        "متوجه نشدم چی گفتی 😅\n"
-        "از دستورات استفاده کن:\n"
+
         "/login\n"
         "/post\n"
         "/logout\n"
