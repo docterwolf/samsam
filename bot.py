@@ -134,7 +134,8 @@ async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title="سر تیتر اگهی",
             description="اناو ابراهام لینکلن بر فراز رود سفید سیاه",
             price="150000",
-            image_paths=None
+            image_paths=["assets/test.jpg"]
+
         )
         await update.message.reply_text(result)
     except Exception as e:
