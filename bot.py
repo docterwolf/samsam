@@ -15,7 +15,9 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-from divar_automation import has_valid_session, start_login, verify_otp, create_post_on_divar
+from divar_automation import (
+    has_valid_session, start_login, verify_otp, create_post_on_divar, logout
+)
 
 load_dotenv()
 
@@ -23,10 +25,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# ---- Conversation States ----
 PHONE, OTP = range(2)
 CAT, TITLE, DESC, PRICE, CONFIRM = range(2, 7)
-
 
 @dataclass
 class PostDraft:
@@ -39,17 +39,11 @@ class PostDraft:
 
 # -------------------- Playwright bootstrap --------------------
 def ensure_playwright_browser_installed():
-    """
-    Ensures Playwright's Chromium exists at runtime.
-    This fixes Render deployments where browsers are not persisted from build.
-    """
     try:
-        # This respects PLAYWRIGHT_BROWSERS_PATH env (you set it to 0)
         print("[startup] Ensuring Playwright Chromium is installed...")
         subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
         print("[startup] Playwright Chromium OK.")
     except Exception as e:
-        # We do NOT crash the service; but automation will fail until fixed.
         print("[startup] Playwright install failed:", repr(e))
 
 
@@ -58,6 +52,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام!\n"
         "/login برای ورود\n"
+        "/logout برای خروج\n"
         "/newpost برای ثبت آگهی\n"
         "/cancel برای لغو"
     )
@@ -65,7 +60,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await has_valid_session():
-        await update.message.reply_text("سشن معتبره ✅")
+        await update.message.reply_text("سشن معتبره ✅\nاگر می‌خوای خارج شی /logout بزن.")
         return ConversationHandler.END
     await update.message.reply_text("شماره موبایل رو بفرست (09xxxxxxxxx):")
     return PHONE
@@ -98,6 +93,15 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("در حال خروج از حساب دیوار و پاک کردن سشن...")
+    try:
+        await logout(update.effective_chat.id)
+        await update.message.reply_text("✅ خارج شدی. حالا می‌تونی دوباره /login بزنی.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در logout: {e}")
+
+
 async def cmd_newpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await has_valid_session():
         await update.message.reply_text("اول /login رو انجام بده.")
@@ -114,7 +118,6 @@ async def post_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("فقط عدد بفرست (مثلاً 0).")
         return CAT
-
     await update.message.reply_text("عنوان آگهی:")
     return TITLE
 
@@ -134,7 +137,6 @@ async def post_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["draft"].price = update.message.text.strip()
     d: PostDraft = context.user_data["draft"]
-
     await update.message.reply_text(
         "تایید نهایی؟ فقط ✅ بفرست\n\n"
         f"category_index: {d.category_index}\n"
@@ -159,6 +161,7 @@ async def post_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             description=d.description,
             price=d.price,
             image_paths=d.image_paths,
+            chat_id=update.effective_chat.id,
         )
         await update.message.reply_text(res)
     except Exception as e:
@@ -197,12 +200,13 @@ def build_telegram_app() -> Application:
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("logout", cmd_logout))
     app.add_handler(login_conv)
     app.add_handler(post_conv)
     return app
 
 
-# -------------------- FastAPI for Render --------------------
+# -------------------- FastAPI (Render Web Service) --------------------
 api = FastAPI()
 telegram_app: Optional[Application] = None
 telegram_task: Optional[asyncio.Task] = None
@@ -210,10 +214,7 @@ telegram_task: Optional[asyncio.Task] = None
 
 @api.get("/")
 async def root():
-    return {
-        "status": "ok",
-        "telegram": "running" if telegram_task and not telegram_task.done() else "stopped"
-    }
+    return {"status": "ok", "telegram": "running" if telegram_task and not telegram_task.done() else "stopped"}
 
 
 @api.get("/health")
@@ -225,7 +226,7 @@ async def health():
 async def on_startup():
     global telegram_app, telegram_task
 
-    # ✅ Fix Playwright missing chromium on Render
+    # Ensure chromium exists (Render fix)
     ensure_playwright_browser_installed()
 
     telegram_app = build_telegram_app()
@@ -234,8 +235,6 @@ async def on_startup():
         await telegram_app.initialize()
         await telegram_app.start()
         await telegram_app.updater.start_polling()
-
-        # keep alive
         while True:
             await asyncio.sleep(3600)
 
@@ -245,19 +244,17 @@ async def on_startup():
 @api.on_event("shutdown")
 async def on_shutdown():
     global telegram_app, telegram_task
-
     try:
         if telegram_app:
             await telegram_app.updater.stop()
             await telegram_app.stop()
             await telegram_app.shutdown()
-    except:
+    except Exception:
         pass
-
     try:
         if telegram_task and not telegram_task.done():
             telegram_task.cancel()
-    except:
+    except Exception:
         pass
 
 
