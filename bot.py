@@ -1,239 +1,380 @@
+"""
+bot.py
+
+این فایل کارهای زیر را انجام می‌دهد:
+1) وب‌سرویس FastAPI برای اینکه Render سرویس را "alive" نگه دارد
+2) اجرای python-telegram-bot به شکل polling داخل startup
+3) مدیریت state چت (کاربر الان شماره می‌دهد یا OTP)
+4) ارسال درخواست‌ها به divar_automation.py و نمایش نتیجه
+
+این فایل "هیچ اتوماسیون مرورگر" را مستقیم انجام نمی‌دهد.
+همه چیز مربوط به مرورگر داخل divar_automation.py است.
+"""
+
 import os
 import re
+import sys
 import asyncio
-from enum import Enum
-from typing import Dict
+import subprocess
+from typing import Dict, Any, Optional
 
 from fastapi import FastAPI
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import uvicorn
+
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-from playwright.async_api import async_playwright, TimeoutError
+# ماژول اتوماسیون دیوار
+from divar_automation import (
+    has_valid_session,
+    start_login,
+    verify_otp,
+    create_post_on_divar,
+    logout,
+)
 
+# -----------------------------
+# 1) ENV (متغیرهای محیطی)
+# -----------------------------
 
-# ================== ENV ==================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DIVAR_CITY_SLUG = os.getenv("DIVAR_CITY_SLUG", "")
-DIVAR_STATE_PATH = os.getenv("DIVAR_STATE_PATH", "/tmp/divar_state.json")
-DIVAR_SUCCESS_TEXT = os.getenv("DIVAR_SUCCESS_TEXT", "ثبت آگهی")
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-
+# توکن ربات تلگرام
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing")
+    raise RuntimeError("BOT_TOKEN is missing. Set it in Render ENV.")
+
+# مسیر عکس تستی برای ثبت آگهی
+# اگر داخل پروژه assets/test.jpg باشد کافی است.
+TEST_IMAGE_PATH = os.getenv("TEST_IMAGE_PATH", "assets/test.jpg")
+
+# -----------------------------
+# 2) FastAPI برای Render
+# -----------------------------
+
+# Render برای Web Service نیاز دارد یک پورت listen کند.
+# ما یک FastAPI ساده می‌سازیم.
+api = FastAPI()
+
+# -----------------------------
+# 3) وضعیت (State) هر چت
+# -----------------------------
+
+# برای هر chat_id ذخیره می‌کنیم کاربر الان در چه مرحله‌ای است:
+# - step = None : هیچ فرآیند لاگینی در جریان نیست
+# - step = "phone" : ربات منتظر شماره است
+# - step = "otp" : ربات منتظر کد ۶ رقمی است
+chat_state: Dict[int, Dict[str, Any]] = {}
 
 
-def divar_new_url():
-    if DIVAR_CITY_SLUG:
-        return f"https://divar.ir/{DIVAR_CITY_SLUG}/new"
-    return "https://divar.ir/new"
+def _log(msg: str):
+    """
+    لاگ ساده برای Render Logs
+    """
+    print(f"[BOT] {msg}")
 
 
-# ================== Playwright Manager ==================
-
-class PW:
-    pw = None
-    browser = None
-    contexts: Dict[int, any] = {}
-    pages: Dict[int, any] = {}
-    lock = asyncio.Lock()
-
-    @classmethod
-    async def start(cls):
-        cls.pw = await async_playwright().start()
-        cls.browser = await cls.pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-
-    @classmethod
-    async def get_context(cls, user_id: int):
-        if user_id in cls.contexts:
-            return cls.contexts[user_id]
-
-        ctx = await cls.browser.new_context()
-        page = await ctx.new_page()
-
-        cls.contexts[user_id] = ctx
-        cls.pages[user_id] = page
-        return ctx
-
-    @classmethod
-    def get_page(cls, user_id: int):
-        return cls.pages[user_id]
-
-    @classmethod
-    async def screenshot(cls, user_id: int, name: str):
-        page = cls.get_page(user_id)
-        os.makedirs("/tmp/screens", exist_ok=True)
-        await page.screenshot(path=f"/tmp/screens/{user_id}_{name}.png", full_page=True)
+def _get_state(chat_id: int) -> Dict[str, Any]:
+    """
+    اگر state برای این چت وجود ندارد، بساز.
+    """
+    if chat_id not in chat_state:
+        chat_state[chat_id] = {"step": None}
+    return chat_state[chat_id]
 
 
-# ================== Telegram State ==================
+# -----------------------------
+# 4) نصب Playwright chromium در Startup
+# -----------------------------
 
-class Step(str, Enum):
-    IDLE = "IDLE"
-    WAIT_PHONE = "WAIT_PHONE"
-    WAIT_OTP = "WAIT_OTP"
+def ensure_playwright_browser_installed():
+    """
+    چرا این کار لازم است؟
+    چون روی Render گاهی Playwright نصب می‌شود ولی مرورگر Chromium دانلود نمی‌شود.
+    نتیجه: خطای Executable doesn't exist...
 
-user_steps: Dict[int, Step] = {}
-user_phone: Dict[int, str] = {}
-
-
-# ================== Helpers ==================
-
-def normalize_phone(text: str):
-    text = re.sub(r"\D", "", text)
-    if text.startswith("98"):
-        text = "0" + text[2:]
-    if text.startswith("9"):
-        text = "0" + text
-    if not text.startswith("09") or len(text) != 11:
-        raise ValueError("شماره صحیح نیست")
-    return text
-
-def normalize_otp(text: str):
-    text = re.sub(r"\D", "", text)
-    if len(text) != 6:
-        raise ValueError("کد باید ۶ رقمی باشد")
-    return text
-
-
-# ================== DOM Checks ==================
-
-async def wait_phone_modal(page):
-    await page.goto(divar_new_url(), wait_until="domcontentloaded")
-    await page.locator('section[role="dialog"]').wait_for(timeout=20000)
-    await page.get_by_text("شمارهٔ موبایل خود را وارد کنید").wait_for(timeout=20000)
-
-async def wait_otp_modal(page):
-    await page.get_by_text("کد تأیید را وارد کنید").wait_for(timeout=20000)
-    await page.locator('input[name="code"]').wait_for(timeout=20000)
-
-async def login_success(page):
+    اینجا در startup:
+      python -m playwright install chromium
+    را اجرا می‌کنیم.
+    """
     try:
-        await page.get_by_text(DIVAR_SUCCESS_TEXT).wait_for(timeout=15000)
-        return True
-    except TimeoutError:
-        return False
+        _log("Installing Playwright chromium (startup)...")
+        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+        _log("Playwright chromium installed.")
+    except Exception as e:
+        _log(f"Playwright install failed: {repr(e)}")
 
 
-# ================== Handlers ==================
+# -----------------------------
+# 5) Command Handlers (دستورات تلگرام)
+# -----------------------------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /start
+    معرفی دستورات و راهنما
+    """
+    await update.message.reply_text(
+        "سلام 👋\n"
+        "دستورات:\n"
+        "/login  ورود با شماره\n"
+        "/status وضعیت سشن\n"
+        "/post   ثبت آگهی تستی (با عکس ثابت)\n"
+        "/logout خروج کامل\n"
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /status
+    بررسی اینکه آیا سشن معتبر است یا نه
+    """
+    await update.message.reply_text("در حال بررسی سشن...")
+    ok = await has_valid_session()
+    await update.message.reply_text("✅ سشن معتبره." if ok else "❌ سشن معتبر نیست.")
+
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_steps[user_id] = Step.WAIT_PHONE
-    await update.message.reply_text("شماره موبایل را ارسال کن:")
+    """
+    /login
+    اگر سشن معتبر بود، پیام می‌دهیم.
+    اگر نبود، وارد مرحله گرفتن شماره می‌شویم.
+    """
+    st = _get_state(update.effective_chat.id)
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    step = user_steps.get(user_id, Step.IDLE)
+    if await has_valid_session():
+        await update.message.reply_text("سشن معتبره ✅\nاگر می‌خوای خارج شی /logout بزن.")
+        st["step"] = None
+        return
 
-    if step == Step.WAIT_PHONE:
-        try:
-            phone = normalize_phone(update.message.text)
-        except Exception as e:
-            await update.message.reply_text(str(e))
+    st["step"] = "phone"
+    await update.message.reply_text("شماره موبایل رو بفرست (09xxxxxxxxx):")
+
+
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /logout
+    خروج واقعی و کامل (طبق divar_automation.logout)
+    """
+    await update.message.reply_text("در حال خروج کامل از دیوار...")
+    try:
+        await logout(update.effective_chat.id)
+        await update.message.reply_text("✅ خارج شدی. حالا /login بزن.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در logout: {e}")
+
+
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /post
+    یک آگهی تستی می‌سازد.
+    چون دیوار خیلی وقت‌ها عکس را اجباری می‌کند، باید عکس داشته باشیم.
+    """
+    chat_id = update.effective_chat.id
+
+    # اگر لاگین نیست، اجازه ثبت نمی‌دهیم
+    if not await has_valid_session():
+        await update.message.reply_text("❌ اول /login کن.")
+        return
+
+    # چک وجود فایل عکس
+    if not os.path.exists(TEST_IMAGE_PATH):
+        await update.message.reply_text(
+            f"❌ عکس تست پیدا نشد: {TEST_IMAGE_PATH}\n"
+            "یک عکس بذار داخل assets/test.jpg و پوش کن.\n"
+            "یا env: TEST_IMAGE_PATH رو تنظیم کن."
+        )
+        return
+
+    await update.message.reply_text("در حال ثبت آگهی تستی...")
+
+    try:
+        # اینجا create_post_on_divar به صورت مرحله‌ای اجرا می‌شود.
+        # اگر خطا بخورد، متن خطا شامل 'مرحله: ...' خواهد بود.
+        res = await create_post_on_divar(
+            chat_id=chat_id,
+            category_index=0,
+            title="آگهی تستی ربات",
+            description="این آگهی توسط ربات ساخته شده است.",
+            price="150000",
+            image_paths=[TEST_IMAGE_PATH],
+        )
+        await update.message.reply_text(res)
+    except Exception as e:
+        # پیام خطا را مستقیم برمی‌گردانیم (شامل مرحله + مسیر فایل دیباگ)
+        await update.message.reply_text(f"❌ {e}")
+
+
+# -----------------------------
+# 6) Message Handler (پیام‌های عادی)
+# -----------------------------
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    این تابع پیام‌های غیر از دستور را مدیریت می‌کند.
+    بر اساس state:
+    - اگر منتظر phone هستیم: شماره را می‌گیریم و start_login می‌زنیم
+    - اگر منتظر otp هستیم: کد را می‌گیریم و verify_otp می‌زنیم
+    """
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    st = _get_state(chat_id)
+    step = st.get("step")
+
+    # -------------------------
+    # حالت 1: منتظر شماره
+    # -------------------------
+    if step == "phone":
+        phone = re.sub(r"\D", "", text)
+
+        # اگر کاربر 98 زد، تبدیل به 0...
+        if phone.startswith("98"):
+            phone = "0" + phone[2:]
+
+        # اعتبارسنجی ساده شماره
+        if not phone.startswith("09") or len(phone) != 11:
+            await update.message.reply_text("❌ شماره معتبر نیست. مثال: 09351234567")
             return
 
-        user_phone[user_id] = phone
+        await update.message.reply_text("در حال درخواست کد...")
 
-        async with PW.lock:
-            try:
-                await PW.get_context(user_id)
-                page = PW.get_page(user_id)
-
-                await wait_phone_modal(page)
-
-                await page.fill('input[name="mobile"]', phone[1:])
-                await page.get_by_role("button", name="تأیید").click()
-
-                await wait_otp_modal(page)
-
-                user_steps[user_id] = Step.WAIT_OTP
-                await update.message.reply_text("کد پیامک را بفرست:")
-            except Exception as e:
-                await PW.screenshot(user_id, "phone_error")
-                await update.message.reply_text(f"خطا: {e}\n/login بزن دوباره")
-
-    elif step == Step.WAIT_OTP:
         try:
-            otp = normalize_otp(update.message.text)
+            # درخواست کد از دیوار
+            await start_login(chat_id, phone)
+
+            # اگر موفق بود، وارد مرحله otp می‌شویم
+            st["step"] = "otp"
+            await update.message.reply_text("کد ۶ رقمی رو بفرست:")
         except Exception as e:
-            await update.message.reply_text(str(e))
+            # اگر خطا شد، state را reset می‌کنیم تا گیج نشود
+            st["step"] = None
+            await update.message.reply_text(f"❌ خطا در درخواست کد: {e}")
+        return
+
+    # -------------------------
+    # حالت 2: منتظر OTP
+    # -------------------------
+    if step == "otp":
+        code = re.sub(r"\D", "", text)[:6]
+
+        if len(code) != 6:
+            await update.message.reply_text("❌ کد باید ۶ رقم باشه.")
             return
 
-        async with PW.lock:
-            try:
-                page = PW.get_page(user_id)
+        await update.message.reply_text("در حال تایید...")
 
-                await page.fill('input[name="code"]', otp)
-                await page.get_by_role("button", name="ورود").click()
-
-                success = await login_success(page)
-
-                if success:
-                    user_steps[user_id] = Step.IDLE
-                    await update.message.reply_text("✅ با موفقیت لاگین شدی")
-                else:
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("بررسی", callback_data="verify")]
-                    ])
-                    await update.message.reply_text(
-                        "⚠️ ظاهراً لاگین نشدی",
-                        reply_markup=kb
-                    )
-
-            except Exception as e:
-                await PW.screenshot(user_id, "otp_error")
-                await update.message.reply_text(f"خطا در OTP: {e}\n/login بزن")
-
-async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    async with PW.lock:
         try:
-            page = PW.get_page(user_id)
-            await page.goto(divar_new_url())
+            ok = await verify_otp(chat_id, code)
 
-            if await login_success(page):
-                await query.edit_message_text("✅ بررسی شد: لاگین موفق است")
-            else:
-                await query.edit_message_text("❌ هنوز لاگین نیستی. /login بزن")
-                user_steps[user_id] = Step.WAIT_PHONE
+            # در هر صورت از حالت otp خارج می‌شویم (موفق یا ناموفق)
+            st["step"] = None
 
+            await update.message.reply_text("✅ لاگین موفق!" if ok else "❌ لاگین ناموفق.")
         except Exception as e:
-            await query.edit_message_text(f"خطا در بررسی: {e}")
+            st["step"] = None
+            await update.message.reply_text(f"❌ خطا در تایید کد: {e}")
+        return
+
+    # -------------------------
+    # حالت 3: هیچ فرآیند لاگین نداریم
+    # -------------------------
+    await update.message.reply_text("از دستورات استفاده کن: /login /status /post /logout")
 
 
-# ================== FastAPI ==================
+# -----------------------------
+# 7) ساخت اپلیکیشن تلگرام
+# -----------------------------
 
-api = FastAPI()
-tg_app = None
+def build_app() -> Application:
+    """
+    اینجا همه handler ها را اضافه می‌کنیم و app تلگرام را می‌سازیم.
+    """
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("login", cmd_login))
+    app.add_handler(CommandHandler("logout", cmd_logout))
+    app.add_handler(CommandHandler("post", cmd_post))
+
+    # پیام‌های متنی که دستور نیستند
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    return app
+
+
+# -----------------------------
+# 8) اجرای تلگرام داخل FastAPI lifecycle
+# -----------------------------
+
+telegram_app: Optional[Application] = None
+telegram_task: Optional[asyncio.Task] = None
+
 
 @api.on_event("startup")
-async def startup():
-    global tg_app
-    await PW.start()
+async def on_startup():
+    """
+    وقتی Render سرویس را بالا می‌آورد:
+    - chromium را نصب می‌کنیم (حل خطای Executable doesn't exist)
+    - اپ تلگرام را initialize و start می‌کنیم
+    - polling را در یک task جدا اجرا می‌کنیم
+    """
+    global telegram_app, telegram_task
 
-    tg_app = Application.builder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("login", cmd_login))
-    tg_app.add_handler(CallbackQueryHandler(verify_callback, pattern="verify"))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    ensure_playwright_browser_installed()
 
-    await tg_app.initialize()
-    await tg_app.start()
+    telegram_app = build_app()
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    telegram_task = asyncio.create_task(telegram_app.updater.start_polling())
+    _log("Telegram polling started.")
+
 
 @api.on_event("shutdown")
-async def shutdown():
-    await PW.browser.close()
+async def on_shutdown():
+    """
+    هنگام خاموش شدن سرویس:
+    - polling را stop
+    - اپ تلگرام را shutdown
+    """
+    global telegram_app, telegram_task
+
+    try:
+        if telegram_task and not telegram_task.done():
+            telegram_task.cancel()
+    except Exception:
+        pass
+
+    try:
+        if telegram_app:
+            await telegram_app.updater.stop()
+            await telegram_app.stop()
+            await telegram_app.shutdown()
+    except Exception:
+        pass
+
+    _log("Telegram stopped.")
+
+
+@api.get("/")
+async def root():
+    """
+    endpoint ساده برای health check
+    """
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    """
+    اجرای لوکال:
+      python bot.py
+    روی Render معمولاً با uvicorn اجرا می‌شود.
+    """
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("bot:api", host="0.0.0.0", port=port, log_level="info")
