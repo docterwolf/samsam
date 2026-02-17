@@ -190,7 +190,7 @@ async def create_post_on_divar(
 
     await page.goto(DIVAR_NEW_URL, timeout=60000)
 
-    await page.wait_for_selector('input[name="Title"]')
+    await page.wait_for_selector('input[name="Title"]', timeout=60000)
     await page.fill('input[name="Title"]', title)
     await page.fill('textarea[name="Description"]', description)
 
