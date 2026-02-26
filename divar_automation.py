@@ -350,6 +350,7 @@ async def start_login(chat_id: int, phone: str) -> None:
         return
 
     # اگر فیلد phone وجود دارد، شماره را وارد کن
+    await page.wait_for_selector(PHONE_INPUT, timeout=60000)
     if await page.locator(PHONE_INPUT).count() > 0:
         _log(step, "Phone input detected. Filling phone...")
 
