@@ -199,6 +199,9 @@ async def create_post_on_divar(
     await page.fill('input[name="Title"]', title)
     await page.fill('textarea[name="Description"]', description)
 
+    image_adder = page.locator('input[type="file"][name="Images"]')
+    await image_adder.wait_for(state="attached", timeout=1200000)
+    await image_adder.set_input_files("https://s8.uupload.ir/files/aa49505504015b9df1265b50fa943237-donoghte.com__asnj.jpg")
     
     await page.click('button[type="submit"]')
     await page.wait_for_timeout(120000)
